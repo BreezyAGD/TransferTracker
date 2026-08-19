@@ -5,7 +5,7 @@ compatibility_date = "2026-08-01"
 [vars]
 # Comma-separated. Replace "*" with your deployed app origin before you submit,
 # e.g. "https://transfertracker.pages.dev,http://localhost:8788"
-ALLOWED_ORIGINS = "*"
+ALLOWED_ORIGINS = "https://transfertracker.pages.dev"
 
 # ANTHROPIC_API_KEY is NOT set here — it is a secret:
 #   wrangler secret put ANTHROPIC_API_KEY
