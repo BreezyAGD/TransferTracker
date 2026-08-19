@@ -72,6 +72,635 @@
   if (ok) document.getElementById('hint').textContent =
     'Everything is wired. Replace this file with the TransferTracker app.';
 })();
+<script>
+  /* =========================================================
+   TransferTracker — upgrade layer
+   ---------------------------------------------------------
+   Paste this whole file as a <script> immediately before </body>
+   in your existing TransferTracker HTML. It overrides three things
+   without touching the rest of the file:
+
+     1. Model access now routes through your Cloudflare Worker, so
+        the AI features work outside the Claude artifact sandbox.
+     2. Students import their own ASSIST agreement (paste or PDF);
+        the plan rebuilds from the real articulation.
+     3. AP credit gets correct per-area units and the cross-exam
+        caps a flat table can't express.
+
+   Nothing above this script needs editing.
+   ========================================================= */
+(function(){
+'use strict';
+
+/* ============ 1. model transport ============ */
+
+const PROXY_URL = 'https://transfertracker.alexjahanlal.workers.dev';   // ← paste your Worker URL here, no trailing slash
+
+const TT_API = (() => {
+  const MODEL = 'claude-sonnet-4-6';
+  let transport = null, probing = null;
+
+  async function post(url, payload, ms){
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), ms || 20000);
+    try{
+      return await fetch(url, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(payload), signal: ctl.signal
+      });
+    } finally { clearTimeout(timer); }
+  }
+
+  async function probe(){
+    if(probing) return probing;
+    probing = (async () => {
+      const ping = {model:MODEL, max_tokens:4, messages:[{role:'user',content:'hi'}]};
+      if(PROXY_URL){
+        try{ if((await post(PROXY_URL, ping, 8000)).ok){ transport='proxy'; return transport; } }catch(e){}
+      }
+      try{
+        if((await post('https://api.anthropic.com/v1/messages', ping, 8000)).ok){ transport='direct'; return transport; }
+      }catch(e){}
+      transport = 'none';
+      return transport;
+    })();
+    return probing;
+  }
+
+  const available = () => transport === 'proxy' || transport === 'direct';
+  const endpoint = () => transport === 'proxy' ? PROXY_URL : 'https://api.anthropic.com/v1/messages';
+
+  function textOf(d){
+    return (d && d.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+  }
+  function jsonOf(d){
+    let t = textOf(d).replace(/```json\s*|```/g,'').trim();
+    try{ return JSON.parse(t); }catch(e){}
+    const s = t.indexOf('{'), e2 = t.lastIndexOf('}');
+    if(s !== -1 && e2 > s){ try{ return JSON.parse(t.slice(s, e2+1)); }catch(e){} }
+    return null;
+  }
+
+  async function send(messages, opts){
+    opts = opts || {};
+    if(transport === null) await probe();
+    if(!available()) return {ok:false, error:'AI features are offline. The rest of the planner still works.'};
+
+    const payload = {model:MODEL, max_tokens: opts.maxTokens || 1200, messages};
+    if(opts.system) payload.system = opts.system;
+    try{
+      const res = await post(endpoint(), payload, opts.timeoutMs || 45000);
+      if(!res.ok){
+        let msg = 'Request failed (' + res.status + ').';
+        if(res.status === 429) msg = 'Too many requests right now. Wait a minute and try again.';
+        try{ const j = await res.json(); if(typeof j.error === 'string') msg = j.error; }catch(e){}
+        return {ok:false, error:msg};
+      }
+      return {ok:true, data: await res.json()};
+    }catch(e){
+      return {ok:false, error: e && e.name === 'AbortError'
+        ? 'That took too long. Try a shorter document.'
+        : 'Could not reach the model service.'};
+    }
+  }
+
+  return {probe, available, send, textOf, jsonOf, transportName: () => transport};
+})();
+window.TT_API = TT_API;
+
+
+/* ============ 2. re-route the two existing fetch call sites ============ */
+
+/* Custom major generation — was a bare keyless fetch. */
+window.buildCustomMajor = async function(){
+  const box = document.querySelector('#majResult');
+  box.innerHTML = '<div class="majcard"><div class="mt">Building a prep list for ' + esc(S.majorText) + '…</div>'
+    + '<div class="md">Checking which lower-division courses California campuses typically expect.</div></div>';
+
+  const ids = Object.entries(CATALOG).map(([k,c]) => k + '=' + c.t).join('; ');
+  const res = await TT_API.send([{role:'user', content:
+`Major: "${S.majorText}"
+
+From this course list, choose the lower-division courses a California community college student would typically need before transferring into this major at a UC or CSU. Use ONLY these ids:
+${ids}
+
+Reply as JSON: {"courses":["ID1","ID2"],"note":"one or two sentences on what makes this major's transfer path distinctive, and what the student must verify"}
+
+Pick 3-8 courses. If the major is unclear or not a real academic major, return {"courses":[],"note":"explain briefly"}.`}],
+    {system:'You map California community college transfer majors to lower-division prep courses. Reply with JSON only — no prose, no markdown fences.', maxTokens:1000});
+
+  if(!res.ok){
+    S.majorSource = 'none';
+    S.customNote = res.error + ' Your plan will still cover Cal-GETC and units, and a counselor can add the major courses.';
+    box.innerHTML = majorCard();
+    return;
+  }
+  const out = TT_API.jsonOf(res.data) || {};
+  const valid = (out.courses || []).filter(id => CATALOG[id]);
+  if(valid.length){
+    S.customPrep = valid; S.majorKey = ''; S.majorSource = 'ai';
+    S.customNote = (out.note || '') + ' This list was generated rather than verified — confirm it on assist.org.';
+  } else {
+    S.majorSource = 'none';
+    S.customNote = out.note || 'No prep list could be built for this major.';
+  }
+  box.innerHTML = majorCard();
+};
+
+/* Assistant chat — KB first, model only for what the KB can't match. */
+window.sendChat = async function(){
+  const inp = document.querySelector('#chatIn'), q = inp.value.trim();
+  if(!q || chatBusy) return;
+  inp.value = '';
+  push('u', q);
+
+  const kb = kbMatch(q);
+  if(kb){
+    const t = typing();
+    setTimeout(() => { t.remove(); push('a', kb); HIST.push({role:'user',content:q},{role:'assistant',content:kb}); }, 320);
+    return;
+  }
+  if(!looksOnTopic(q)){
+    const t = typing();
+    setTimeout(() => { t.remove(); push('a',
+      "That's outside what I cover. I'm here for California community college transfer — Cal-GETC, ADTs, TAG, major prep, impaction, deadlines, financial aid, or the roadmap you're building on this site.\n\nAnything along those lines?"); }, 250);
+    return;
+  }
+
+  chatBusy = true;
+  document.querySelector('#chatSend').disabled = true;
+  const t = typing();
+  const res = await TT_API.send([...HIST.slice(-8), {role:'user', content:q}],
+    {system: SYS + '\n\n' + planContext(), maxTokens:1000});
+  t.remove();
+  if(res.ok){
+    const text = TT_API.textOf(res.data);
+    if(text){ push('a', text); HIST.push({role:'user',content:q},{role:'assistant',content:text}); }
+    else push('a', "I couldn't get an answer back that time. Try rephrasing, or ask one of the common questions in the sidebar.");
+  } else {
+    push('a', "I couldn't reach the assistant just now. The built-in answers still work — try **ADTs**, **Cal-GETC**, **TAG**, **units**, **GPA**, **impaction**, **deadlines**, **major prep**, **nursing**, or **financial aid**.");
+  }
+  chatBusy = false;
+  document.querySelector('#chatSend').disabled = false;
+};
+
+
+/* ============ 3. AP credit corrections ============
+   Per ICAS Cal-GETC Standards §6.1, an acceptable score is worth 3
+   semester units toward certification — except Biology, Chemistry,
+   Physics 1 and Physics 2, which are worth 4. Environmental Science
+   and both Physics C exams stay at 3, which means they do NOT meet
+   the Area 5 unit minimum on their own. A flat per-exam table can't
+   say that, so the units are corrected here and the cross-exam caps
+   are applied as a separate layer. */
+
+const AP_FOUR_UNIT = ['bio','chem','phys1','phys2'];
+AP_EXAMS.forEach(e => { if(AP_FOUR_UNIT.includes(e.id)) e.u = 4; });
+
+/* Cross-exam caps. Sources: UC AP credits; CSU systemwide external exams. */
+const AP_CAPS = [
+  {id:'uc-calc',    sys:'UC',  ids:['calcab','calcbc'], maxUnits:5.3,
+   msg:'UC caps Calculus AB and BC combined at 5.3 semester units.'},
+  {id:'uc-art',     sys:'UC',  ids:['art2d'], maxUnits:5.3,
+   msg:'UC caps all three Art & Design exams combined at 5.3 semester units.'},
+  {id:'uc-english', sys:'UC',  ids:['englang','englit'], maxUnits:5.3,
+   msg:'UC caps both English exams combined at 5.3 semester units, and only one of the two English courses required for transfer admission may be satisfied by an exam.'},
+  {id:'csu-calc',   sys:'CSU', ids:['calcab','calcbc'], maxExams:1,
+   msg:'CSU applies only one calculus exam toward the baccalaureate.'},
+  {id:'csu-cs',     sys:'CSU', ids:['csa','csp'], maxExams:1,
+   msg:'CSU applies only one computer science exam toward the baccalaureate.'},
+  {id:'csu-physics',sys:'CSU', ids:['phys1','phys2','physcm','physce'], maxUnits:6,
+   msg:'CSU applies at most 6 units of physics toward the degree and 4 toward general education.'}
+];
+
+function apCapReport(){
+  const scored = Object.keys(S.ap).filter(id => +S.ap[id] >= 3);
+  const sys = systems();
+  const hits = [];
+  AP_CAPS.forEach(cap => {
+    if(!sys.includes(cap.sys)) return;
+    const mine = cap.ids.filter(id => scored.includes(id));
+    if(mine.length < 2 && !(cap.maxExams && mine.length > cap.maxExams)) return;
+    if(cap.maxExams && mine.length > cap.maxExams){
+      hits.push({msg: cap.msg, exams: mine.map(id => AP[id].n)});
+      return;
+    }
+    if(cap.maxUnits){
+      const total = mine.reduce((s,id) => s + (AP[id].u || 3), 0);
+      if(total > cap.maxUnits) hits.push({msg: cap.msg, exams: mine.map(id => AP[id].n)});
+    }
+  });
+  return hits;
+}
+
+
+/* ============ 4. ASSIST agreement import ============
+   The app stores no articulation data. ASSIST declined third-party API
+   access, and scraping it is what degraded the service for everyone
+   else — so the student brings their own agreement and we parse it.
+   Nothing is cached, which means nothing goes stale. */
+
+S.assist = null;
+
+const ASSIST_SYSTEM = `You extract structured data from California ASSIST.org articulation agreements.
+
+An ASSIST agreement pairs requirements at a receiving university (UC, CSU, or independent) with the courses at one sending community college that satisfy them. Where the text contains "||", the receiving requirement is on the left and the sending community college equivalent is on the right.
+
+Read carefully for these, because students are harmed most when they are missed:
+- "No Course Articulated" / "Not Articulated" — the requirement CANNOT be satisfied at this college. This is critical information, not an absence of information. Record it.
+- AND vs OR between sending courses. "BIOL 1 AND BIOL 2" means both are required. "MATH 1 OR MATH 2" means either suffices. Never collapse AND into OR.
+- Notes attached to a requirement, such as a minimum grade.
+
+Reply with JSON only. No prose, no markdown fences.`;
+
+function assistPrompt(text, hint){
+  return `Extract this articulation agreement.
+${hint ? '\nThe student says this is for: ' + hint + '\n' : ''}
+Return this exact JSON shape:
+
+{
+  "meta": {"sendingCollege": null, "receivingCampus": null, "major": null, "academicYear": null, "confidence": "high|medium|low"},
+  "requirements": [
+    {"receiving":"MAT 016A Calculus","sendingCourses":[{"code":"MATH 400","title":"Calculus I","units":5}],"logic":"AND|OR|SINGLE|NONE","articulated":true,"notes":null}
+  ],
+  "unarticulated": ["requirements marked No Course Articulated"],
+  "warnings": ["anything ambiguous the student should verify by eye"]
+}
+
+Rules:
+- "logic" is NONE when articulated is false.
+- Set articulated:false and add the requirement text to "unarticulated" when the agreement says no course is articulated.
+- If units are not stated, use null. Do not guess.
+- Set confidence to "low" if the text looks truncated, scrambled, or is not an articulation agreement.
+- Include every requirement you find, even ones with no sending equivalent.
+
+AGREEMENT TEXT:
+${text}`;
+}
+
+/* ASSIST agreements are two-column. Naive PDF extraction interleaves the
+   receiving requirement with the sending course and destroys the pairing,
+   so bucket text items by x-position and emit "LEFT || RIGHT" per row. */
+async function assistPdfText(file, onProgress){
+  const lib = window.pdfjsLib;
+  if(!lib) throw new Error('The PDF reader did not load. Paste the text instead.');
+  if(lib.GlobalWorkerOptions && !lib.GlobalWorkerOptions.workerSrc)
+    lib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+  const pdf = await lib.getDocument({data: await file.arrayBuffer()}).promise;
+  const pages = [];
+  for(let p = 1; p <= pdf.numPages; p++){
+    if(onProgress) onProgress(p, pdf.numPages);
+    const page = await pdf.getPage(p);
+    const content = await page.getTextContent();
+    const mid = page.getViewport({scale:1}).width / 2;
+    const rows = new Map();
+    content.items.forEach(it => {
+      if(!it.str || !it.str.trim()) return;
+      const x = it.transform[4], y = Math.round(it.transform[5] / 4) * 4;
+      if(!rows.has(y)) rows.set(y, {L:[], R:[]});
+      rows.get(y)[x < mid ? 'L' : 'R'].push({x, s: it.str});
+    });
+    const lines = [...rows.entries()].sort((a,b) => b[0] - a[0]).map(([,r]) => {
+      const L = r.L.sort((a,b)=>a.x-b.x).map(i=>i.s).join(' ').replace(/\s+/g,' ').trim();
+      const R = r.R.sort((a,b)=>a.x-b.x).map(i=>i.s).join(' ').replace(/\s+/g,' ').trim();
+      if(!L && !R) return '';
+      return R ? L + '  ||  ' + R : L;
+    }).filter(Boolean);
+    pages.push('--- page ' + p + ' ---\n' + lines.join('\n'));
+  }
+  const text = pages.join('\n\n');
+  if(!text.trim()) throw new Error('That PDF has no readable text — it may be a scan. Paste the text instead.');
+  return text.slice(0, 60000);
+}
+
+/* Map parsed sending courses onto catalog ids so the planner can schedule them. */
+function assistMerge(ag){
+  const matched = [], unmatched = [], blocked = [];
+  const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g,'');
+  const index = new Map();
+  Object.keys(CATALOG).forEach(id => {
+    const c = CATALOG[id];
+    index.set(norm(c.t), id);
+    if(c.cid) index.set(norm(c.cid), id);
+    const loc = localOf(id);
+    if(loc) index.set(norm(loc), id);
+  });
+
+  (ag.requirements || []).forEach(req => {
+    if(!req.articulated){ blocked.push({receiving: req.receiving, notes: req.notes || null}); return; }
+    (req.sendingCourses || []).forEach(sc => {
+      const id = index.get(norm(sc.code)) || index.get(norm(sc.title));
+      if(id) matched.push({id, receiving: req.receiving, code: sc.code, title: sc.title, logic: req.logic});
+      else unmatched.push({receiving: req.receiving, code: sc.code, title: sc.title, units: sc.units == null ? null : sc.units});
+    });
+  });
+
+  return {
+    matched, unmatched, blocked,
+    requiredIds: [...new Set(matched.filter(m => m.logic !== 'OR').map(m => m.id))],
+    summary: {
+      total: (ag.requirements || []).length,
+      blocked: blocked.length,
+      matchedToCatalog: matched.length,
+      needsManualAdd: unmatched.length
+    }
+  };
+}
+
+/* Courses from a real agreement become required, so buildPlan schedules them
+   and the audit checks them. This is what makes the import change the plan
+   rather than just display a list. */
+const _activeMajor = window.activeMajor;
+window.activeMajor = function(){
+  const m = _activeMajor();
+  if(!S.assist || !S.assist.merge) return m;
+  const extra = S.assist.merge.requiredIds.filter(id => CATALOG[id] && !m.req.includes(id));
+  if(!extra.length) return {...m, source:'assist'};
+  return {...m, req: m.req.concat(extra), source:'assist'};
+};
+
+/* Import-derived warnings, plus the AP caps, layered onto the existing set. */
+const _warnings = window.warnings;
+window.warnings = function(a){
+  const w = _warnings(a);
+
+  apCapReport().forEach(h => w.push({t:'warn',
+    m: h.msg + ' This affects ' + h.exams.join(' and ') + ', so the units shown here may be higher than the campus will award.'}));
+
+  const thin = (a.aps || []).map(id => AP[id.slice(3)])
+    .filter(e => e && e.c && e.c.area === '5' && (e.u || 3) < 4);
+  if(thin.length) w.push({t:'warn',
+    m: thin.map(e => 'AP ' + e.n).join(' and ') + (thin.length === 1 ? ' is' : ' are')
+     + ' worth only 3 semester units toward Cal-GETC, below the Area 5 unit minimum. You will still need additional science units.'});
+
+  if(S.assist && S.assist.merge){
+    const mg = S.assist.merge, ag = S.assist.agreement, meta = ag.meta || {};
+    if(mg.blocked.length)
+      w.push({t:'bad', sev:'stop', m: mg.blocked.length + ' requirement' + (mg.blocked.length === 1 ? '' : 's')
+        + ' at ' + (meta.receivingCampus || 'this campus') + ' ' + (mg.blocked.length === 1 ? 'has' : 'have')
+        + ' no articulated course at your college: ' + mg.blocked.slice(0,3).map(b => b.receiving).join('; ')
+        + (mg.blocked.length > 3 ? '…' : '') + '. You will take ' + (mg.blocked.length === 1 ? 'it' : 'them')
+        + ' after transfer, or ask your counselor about a substitution.'});
+    if(mg.unmatched.length)
+      w.push({t:'warn', m: mg.unmatched.length + ' course' + (mg.unmatched.length === 1 ? '' : 's')
+        + ' from your agreement ' + (mg.unmatched.length === 1 ? 'is' : 'are') + " not in this planner's catalog: "
+        + mg.unmatched.slice(0,4).map(u => u.code || u.title).join(', ')
+        + '. Add ' + (mg.unmatched.length === 1 ? 'it' : 'them') + ' manually so your unit count is right.'});
+    if(meta.confidence === 'low')
+      w.push({t:'bad', sev:'stop', m:'This agreement was hard to read, so treat everything imported from it as unconfirmed. Compare against the assist.org page before you register.'});
+    (ag.warnings || []).forEach(x => w.push({t:'warn', m:String(x)}));
+    w.push({t:'tip', m: meta.academicYear
+      ? 'Imported from your ' + meta.academicYear + ' ASSIST agreement. Agreements are year-specific — use the one matching the year you began continuous enrollment.'
+      : 'No academic year was found in this agreement. Confirm you pulled the year matching your continuous enrollment.'});
+  }
+  return w;
+};
+
+
+/* ============ 5. import UI ============ */
+
+const CSS = `
+.ai-panel{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+  box-shadow:var(--shadow);padding:20px 22px;margin-bottom:22px}
+.ai-panel.on{border-color:var(--ok);background:#F7FCF9}
+.ai-head{display:flex;align-items:flex-start;gap:14px;flex-wrap:wrap}
+.ai-head h4{font-family:var(--display);font-weight:800;font-size:17px;letter-spacing:-.02em}
+.ai-head p{font-size:13.5px;color:var(--slate);margin-top:6px;max-width:56em}
+.ai-head .sp{flex:1;min-width:120px}
+.ai-stats{display:flex;gap:22px;flex-wrap:wrap;margin-top:16px;padding-top:16px;border-top:1px solid var(--line)}
+.ai-stat .k{font-family:var(--mono);font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--mist)}
+.ai-stat .v{font-family:var(--display);font-weight:800;font-size:20px;margin-top:3px}
+.ai-stat .v.bad{color:var(--flag)}
+.ai-stat .v.ok{color:var(--ok)}
+.ai-back{position:fixed;inset:0;z-index:400;background:rgba(15,46,43,.55);backdrop-filter:blur(3px);
+  display:flex;align-items:center;justify-content:center;padding:24px}
+.ai-modal{background:var(--card);border-radius:18px;width:min(720px,100%);max-height:90vh;
+  display:flex;flex-direction:column;overflow:hidden;box-shadow:0 30px 80px -20px rgba(15,46,43,.6)}
+.ai-mh{padding:18px 22px;border-bottom:1px solid var(--line);background:#FAFBFA;display:flex;align-items:center;gap:12px}
+.ai-mh .t{font-family:var(--display);font-weight:800;font-size:18px;flex:1}
+.ai-mb{padding:22px;overflow-y:auto}
+.ai-steps{list-style:none;margin:0 0 18px;padding:0;counter-reset:s}
+.ai-steps li{counter-increment:s;display:flex;gap:11px;font-size:13.5px;color:var(--pine);padding:5px 0}
+.ai-steps li::before{content:counter(s);font-family:var(--mono);font-size:10px;width:19px;height:19px;
+  border-radius:6px;background:var(--mint);color:var(--pine);display:grid;place-items:center;flex:none;margin-top:2px}
+.ai-ta{width:100%;min-height:170px;padding:12px;border:1px solid var(--line);border-radius:10px;
+  font-family:var(--mono);font-size:12px;line-height:1.5;resize:vertical}
+.ai-ta:focus{outline:none;border-color:var(--pine);box-shadow:0 0 0 3px rgba(29,74,69,.12)}
+.ai-or{text-align:center;font-family:var(--mono);font-size:10px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--mist);margin:14px 0}
+.ai-drop{border:1.5px dashed var(--line);border-radius:12px;padding:22px;text-align:center;
+  font-size:13.5px;color:var(--slate);cursor:pointer}
+.ai-drop:hover,.ai-drop.over{border-color:var(--pine);background:#FBFDF0;color:var(--ink)}
+.ai-msg{margin-top:14px;padding:12px 14px;border-radius:10px;font-size:13.5px;line-height:1.5}
+.ai-msg.err{background:var(--flag-soft);color:#8A3218}
+.ai-msg.work{background:#FDF4DF;color:#6E5008}
+.ai-res{margin-top:4px}
+.ai-grp{margin-top:16px}
+.ai-grp .gh{font-family:var(--mono);font-size:10px;letter-spacing:.13em;text-transform:uppercase;
+  color:var(--slate);margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.ai-grp .gh .n{background:var(--ink);color:#F4F6F3;border-radius:5px;padding:1px 6px;font-size:10px}
+.ai-row{display:flex;gap:10px;align-items:baseline;padding:8px 11px;border-radius:8px;
+  font-size:13px;margin-bottom:5px;background:#F6F8F5}
+.ai-row.stop{background:#FDEDE8;border-left:4px solid var(--flag);color:#7E2E15}
+.ai-row.ok{background:#F0F8F3;border-left:4px solid var(--ok)}
+.ai-row .rc{font-family:var(--mono);font-size:11px;color:var(--slate);flex:none}
+.ai-row .rn{flex:1}
+.ai-badge{font-family:var(--mono);font-size:9px;letter-spacing:.06em;text-transform:uppercase;
+  padding:2px 6px;border-radius:4px;background:var(--mint);color:var(--pine);flex:none}
+`;
+const st = document.createElement('style'); st.textContent = CSS; document.head.appendChild(st);
+
+function assistPanelHTML(){
+  const on = !!(S.assist && S.assist.merge);
+  if(!on) return `<div class="ai-panel no-print">
+    <div class="ai-head">
+      <div style="flex:1;min-width:260px">
+        <h4>This plan is an estimate. Make it exact.</h4>
+        <p>Right now these courses come from statewide C-ID descriptors — a good approximation, but not your college's actual agreement. Paste your real ASSIST agreement and the plan rebuilds from it, including any requirement that <b>can't</b> be satisfied at your college.</p>
+      </div>
+      <button class="btn lime" onclick="openAssist()">Import my ASSIST agreement</button>
+    </div></div>`;
+
+  const mg = S.assist.merge, meta = S.assist.agreement.meta || {};
+  return `<div class="ai-panel on no-print">
+    <div class="ai-head">
+      <div style="flex:1;min-width:260px">
+        <h4>Built from your ASSIST agreement</h4>
+        <p>${esc([meta.sendingCollege, meta.receivingCampus, meta.major, meta.academicYear].filter(Boolean).join(' → ') || 'Imported agreement')}</p>
+      </div>
+      <button class="btn alt sm" onclick="openAssist()">Import another</button>
+      <button class="btn ghost sm" onclick="clearAssist()">Remove</button>
+    </div>
+    <div class="ai-stats">
+      <div class="ai-stat"><div class="k">Requirements read</div><div class="v">${mg.summary.total}</div></div>
+      <div class="ai-stat"><div class="k">Matched to plan</div><div class="v ok">${mg.summary.matchedToCatalog}</div></div>
+      <div class="ai-stat"><div class="k">Not articulated</div><div class="v ${mg.blocked.length?'bad':''}">${mg.blocked.length}</div></div>
+      <div class="ai-stat"><div class="k">Add manually</div><div class="v">${mg.unmatched.length}</div></div>
+    </div>
+    ${mg.blocked.length ? `<div class="ai-grp">
+      <div class="gh"><span class="n">${mg.blocked.length}</span> Cannot be taken at your college</div>
+      ${mg.blocked.map(b => `<div class="ai-row stop"><span class="rn">${esc(b.receiving)}</span>
+        <span class="ai-badge" style="background:var(--flag-soft);color:var(--flag)">After transfer</span></div>`).join('')}
+    </div>` : ''}
+    ${mg.matched.length ? `<div class="ai-grp">
+      <div class="gh"><span class="n">${mg.matched.length}</span> Confirmed by your agreement</div>
+      ${mg.matched.slice(0,8).map(m => `<div class="ai-row ok">
+        <span class="rc">${esc(m.code || '')}</span><span class="rn">${esc(CATALOG[m.id] ? CATALOG[m.id].t : m.title)}</span>
+        <span class="ai-badge">${esc(m.receiving)}</span></div>`).join('')}
+      ${mg.matched.length > 8 ? `<div style="font-size:12.5px;color:var(--mist);padding-left:11px">and ${mg.matched.length - 8} more</div>` : ''}
+    </div>` : ''}
+    ${mg.unmatched.length ? `<div class="ai-grp">
+      <div class="gh"><span class="n">${mg.unmatched.length}</span> Required, but not in this planner's catalog</div>
+      ${mg.unmatched.map(u => `<div class="ai-row"><span class="rc">${esc(u.code || '')}</span>
+        <span class="rn">${esc(u.title || u.receiving)}</span></div>`).join('')}
+    </div>` : ''}
+  </div>`;
+}
+
+window.openAssist = function(){
+  const hint = [S.college, campusList().map(c => c.n)[0], activeMajor().n].filter(Boolean).join(' → ');
+  const back = document.createElement('div');
+  back.className = 'ai-back'; back.id = 'aiBack';
+  back.onclick = e => { if(e.target === back) closeAssist(); };
+  back.innerHTML = `<div class="ai-modal" role="dialog" aria-label="Import ASSIST agreement">
+    <div class="ai-mh"><div class="t">Import your ASSIST agreement</div>
+      <button class="pv-close" onclick="closeAssist()" aria-label="Close">×</button></div>
+    <div class="ai-mb">
+      <ol class="ai-steps">
+        <li>Open <a href="https://assist.org" target="_blank" rel="noopener" style="color:var(--ink)">assist.org</a> and choose your college, your transfer campus, and your major.</li>
+        <li>Select all the requirements on that page and copy them — or download the PDF.</li>
+        <li>Paste below, or drop the PDF in. Nothing is stored; it's read once and turned into your plan.</li>
+      </ol>
+      <textarea class="ai-ta" id="aiText" placeholder="Paste your agreement here…"></textarea>
+      <div class="ai-or">or</div>
+      <div class="ai-drop" id="aiDrop">Drop your ASSIST PDF here, or click to choose a file
+        <input type="file" id="aiFile" accept="application/pdf,.pdf" style="display:none"></div>
+      <div id="aiMsg"></div>
+      <div style="display:flex;gap:10px;margin-top:18px">
+        <div style="flex:1"></div>
+        <button class="btn alt" onclick="closeAssist()">Cancel</button>
+        <button class="btn lime" id="aiGo" onclick="runAssist()">Build my plan from this</button>
+      </div>
+    </div></div>`;
+  document.body.appendChild(back);
+  document.addEventListener('keydown', aiEsc);
+  back.dataset.hint = hint;
+
+  const drop = document.getElementById('aiDrop'), file = document.getElementById('aiFile');
+  drop.onclick = () => file.click();
+  drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
+  drop.ondragleave = () => drop.classList.remove('over');
+  drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over');
+    if(e.dataTransfer.files[0]) takeFile(e.dataTransfer.files[0]); };
+  file.onchange = () => { if(file.files[0]) takeFile(file.files[0]); };
+  setTimeout(() => document.getElementById('aiText').focus(), 80);
+};
+function aiEsc(e){ if(e.key === 'Escape') closeAssist(); }
+window.closeAssist = function(){
+  const b = document.getElementById('aiBack');
+  if(b) b.remove();
+  document.removeEventListener('keydown', aiEsc);
+};
+function aiMsg(html, kind){
+  const el = document.getElementById('aiMsg');
+  if(el) el.innerHTML = html ? '<div class="ai-msg ' + (kind || '') + '">' + html + '</div>' : '';
+}
+
+let pendingText = '';
+async function takeFile(f){
+  if(!/pdf$/i.test(f.name)){ aiMsg('That is not a PDF. Paste the text instead.', 'err'); return; }
+  aiMsg('Reading ' + esc(f.name) + '…', 'work');
+  try{
+    pendingText = await assistPdfText(f, (p,n) => aiMsg('Reading page ' + p + ' of ' + n + '…', 'work'));
+    document.getElementById('aiText').value = pendingText.slice(0, 4000)
+      + (pendingText.length > 4000 ? '\n\n… (' + pendingText.length + ' characters read)' : '');
+    aiMsg('Read ' + esc(f.name) + '. Click <b>Build my plan from this</b>.', 'work');
+  }catch(e){ pendingText = ''; aiMsg(esc(e.message), 'err'); }
+}
+
+window.runAssist = async function(){
+  const ta = document.getElementById('aiText');
+  const text = pendingText || (ta ? ta.value.trim() : '');
+  if(!text || text.length < 60){
+    aiMsg('That does not look like an agreement yet. Paste the requirements section from assist.org, or drop the PDF in.', 'err');
+    return;
+  }
+  const btn = document.getElementById('aiGo');
+  btn.disabled = true;
+  aiMsg('Reading your agreement — this takes a few seconds…', 'work');
+
+  const hint = (document.getElementById('aiBack') || {}).dataset
+    ? document.getElementById('aiBack').dataset.hint : '';
+  const res = await TT_API.send([{role:'user', content: assistPrompt(text.slice(0,60000), hint)}],
+    {system: ASSIST_SYSTEM, maxTokens:4000, timeoutMs:60000});
+
+  if(!res.ok){ btn.disabled = false; aiMsg(esc(res.error), 'err'); return; }
+  const ag = TT_API.jsonOf(res.data);
+  if(!ag || !Array.isArray(ag.requirements) || !ag.requirements.length){
+    btn.disabled = false;
+    aiMsg('Could not read that as an articulation agreement. Try copying just the requirements section as text.', 'err');
+    return;
+  }
+
+  ag.meta = ag.meta || {};
+  ag.importedAt = new Date().toISOString();
+  S.assist = {agreement: ag, merge: assistMerge(ag)};
+
+  pendingText = '';
+  closeAssist();
+  buildPlan();
+  renderRoadmap();
+  window.scrollTo({top:0, behavior:'smooth'});
+};
+
+window.clearAssist = function(){
+  S.assist = null;
+  buildPlan();
+  renderRoadmap();
+};
+
+/* Draw the panel above the roadmap grid on every render. */
+const _renderRoadmap = window.renderRoadmap;
+window.renderRoadmap = function(){
+  _renderRoadmap();
+  const grid = document.querySelector('#tab-roadmap .rm-grid');
+  if(!grid) return;
+  let holder = document.getElementById('aiPanel');
+  if(!holder){
+    holder = document.createElement('div');
+    holder.id = 'aiPanel';
+    grid.parentNode.insertBefore(holder, grid);
+  }
+  holder.innerHTML = assistPanelHTML();
+};
+
+/* Tell the assistant what the import changed, so chat answers stay consistent. */
+const _planContext = window.planContext;
+window.planContext = function(){
+  let ctx = _planContext();
+  if(S.assist && S.assist.merge){
+    const mg = S.assist.merge, meta = S.assist.agreement.meta || {};
+    ctx += `\nASSIST agreement imported by the student: ${meta.sendingCollege || '?'} → ${meta.receivingCampus || '?'}, ${meta.major || '?'}, ${meta.academicYear || 'year unknown'}.`
+      + ` Requirements with NO articulated course at this college (student must take these after transfer): ${mg.blocked.map(b=>b.receiving).join('; ') || 'none'}.`
+      + ` Courses confirmed by the agreement: ${mg.matched.map(m=>m.code||m.title).join(', ') || 'none'}.`
+      + ` This is real articulation data the student supplied, so it outranks the generic C-ID estimates elsewhere in this plan.`;
+  }
+  return ctx;
+};
+
+/* Probe once so AI features fail before the student invests in a form. */
+TT_API.probe().then(t => {
+  if(t === 'none'){
+    const b = document.querySelector('[onclick="openAssist()"]');
+    if(b){ b.disabled = true; b.title = 'AI features are offline — set PROXY_URL in the upgrade script.'; }
+    console.warn('TransferTracker: no model transport. Set PROXY_URL to your Worker URL.');
+  } else {
+    console.log('TransferTracker: model transport =', t);
+  }
+});
+
+})();
 </script>
 </body>
 </html>
