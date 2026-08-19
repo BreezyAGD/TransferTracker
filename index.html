@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TransferTracker — deployment check</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; min-height: 100vh;
+    display: grid; place-items: center;
+    font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    background: #0f1720; color: #e6edf3; padding: 24px;
+  }
+  main { max-width: 34rem; }
+  h1 { font-size: 1.4rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
+  p.sub { margin: 0 0 1.75rem; color: #8b98a5; }
+  .row {
+    display: flex; gap: .75rem; align-items: baseline;
+    padding: .8rem 0; border-top: 1px solid #21303d;
+  }
+  .row:last-of-type { border-bottom: 1px solid #21303d; }
+  .k { flex: 1; }
+  .v { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .ok { color: #4ade80; } .bad { color: #f87171; } .wait { color: #8b98a5; }
+  code { background: #1a2530; padding: .12em .4em; border-radius: 4px; font-size: .87em; }
+  .note { margin-top: 1.5rem; color: #8b98a5; font-size: .9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>TransferTracker</h1>
+  <p class="sub">Deployment check — replace this file with the app once it's forked.</p>
+
+  <div class="row"><span class="k">Static hosting (Pages)</span><span class="v ok">serving</span></div>
+  <div class="row"><span class="k">Modules loaded</span><span class="v wait" id="mods">checking…</span></div>
+  <div class="row"><span class="k">Model access</span><span class="v wait" id="api">checking…</span></div>
+  <div class="row"><span class="k">Transport</span><span class="v wait" id="transport">—</span></div>
+
+  <p class="note" id="hint">
+    If model access fails, set <code>PROXY_URL</code> in
+    <code>public/modules/tt-api.js</code> to your deployed Worker URL, then redeploy.
+  </p>
+</main>
+
+<script src="./modules/tt-api.js"></script>
+<script src="./modules/ap-credit.js"></script>
+<script src="./modules/assist-import.js"></script>
+<script>
+(async () => {
+  const set = (id, text, cls) => {
+    const el = document.getElementById(id);
+    el.textContent = text;
+    el.className = 'v ' + cls;
+  };
+
+  const loaded = typeof TT_API !== 'undefined'
+    && typeof apCredit === 'function'
+    && typeof ASSIST_IMPORT !== 'undefined';
+  set('mods', loaded ? '3 of 3' : 'failed', loaded ? 'ok' : 'bad');
+
+  if (!loaded) { set('api', 'skipped', 'bad'); return; }
+
+  // Prove the AP engine actually runs: UC caps Calc AB+BC at 5.3 semester units.
+  const t = apCredit({ calcab: 5, calcbc: 5 }, { systems: ['UC'] });
+  if (t.totalUnits !== 5.3) set('mods', 'loaded, rules failing', 'bad');
+
+  await TT_API.probe();
+  const ok = TT_API.available();
+  set('api', ok ? 'working' : 'offline', ok ? 'ok' : 'bad');
+  set('transport', TT_API.transportName() || '—', ok ? 'ok' : 'bad');
+  if (ok) document.getElementById('hint').textContent =
+    'Everything is wired. Replace this file with the TransferTracker app.';
+})();
+</script>
+</body>
+</html>

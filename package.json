@@ -1,0 +1,13 @@
+{
+  "name": "transfertracker-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Server-side proxy holding the Anthropic API key for TransferTracker",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}

@@ -1,0 +1,21 @@
+# Secrets — never commit these
+.dev.vars
+.env
+.env.*
+*.pem
+
+# Wrangler / Cloudflare
+.wrangler/
+worker/.wrangler/
+
+# Vercel
+.vercel/
+
+# Node
+node_modules/
+npm-debug.log*
+package-lock.json
+
+# OS
+.DS_Store
+Thumbs.db
