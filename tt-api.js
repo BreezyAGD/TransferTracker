@@ -18,7 +18,7 @@ const TT_API = (() => {
   // ---- configure this ----------------------------------------------------
   // After deploying: wrangler deploy → https://transfertracker-proxy.<you>.workers.dev
   //                  vercel --prod   → https://<project>.vercel.app/api/claude
-  const PROXY_URL = 'transfertracker.alexjahanlal.workers.dev';   // leave '' to run artifact-only
+  const PROXY_URL = 'https://transfertracker.alexjahanlal.workers.dev';   // leave '' to run artifact-only
 
   const MODEL = 'claude-sonnet-4-6';
 
